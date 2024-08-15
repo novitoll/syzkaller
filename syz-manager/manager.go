@@ -70,10 +70,29 @@ var (
 	flagTests = flag.String("tests", "", "prefix to match test file names (for -mode run-tests)")
 )
 
+type managerDependencies interface {
+	initStats()
+	initHTTP()
+	initRPC()
+	initDash()
+	initAssetStorage()
+	initBench()
+}
+
+type managerImpl interface {
+	managerDependencies
+	heartbeatLoop()
+	preloadCorpus()
+	corpusInputHandler(<-chan corpus.NewItemEvent)
+	trackUsedFiles()
+	processFuzzingResults(ctx context.Context)
+}
+
 type Manager struct {
 	cfg             *mgrconfig.Config
 	mode            Mode
 	vmPool          *vm.Pool
+	poolImpl        dispatcher.PoolImpl[*vm.Instance]
 	pool            *dispatcher.Pool[*vm.Instance]
 	target          *prog.Target
 	sysTarget       *targets.Target
@@ -84,6 +103,7 @@ type Manager struct {
 	corpusDB        *db.DB
 	corpusDBMu      sync.Mutex // for concurrent operations on corpusDB
 	corpusPreload   chan []fuzzer.Candidate
+	corpusUpdates   chan corpus.NewItemEvent
 	firstConnect    atomic.Int64 // unix time, or 0 if not connected
 	crashTypes      map[string]bool
 	enabledFeatures flatrpc.Feature
@@ -122,6 +142,65 @@ type Manager struct {
 	reproMgr *reproManager
 
 	Stats
+}
+
+func newManager(
+	cfg *mgrconfig.Config,
+	mode Mode,
+	vmPool *vm.Pool,
+	corpusUpdates chan corpus.NewItemEvent,
+	corpusPreload chan []fuzzer.Candidate,
+) *Manager {
+	return &Manager{
+		cfg:                cfg,
+		mode:               mode,
+		vmPool:             vmPool,
+		corpusPreload:      corpusPreload,
+		corpusUpdates:      corpusUpdates,
+		target:             cfg.Target,
+		sysTarget:          cfg.SysTarget,
+		crashTypes:         make(map[string]bool),
+		disabledHashes:     make(map[string]struct{}),
+		memoryLeakFrames:   make(map[string]bool),
+		dataRaceFrames:     make(map[string]bool),
+		fresh:              true,
+		externalReproQueue: make(chan *Crash, 10),
+		crashes:            make(chan *Crash, 10),
+		saturatedCalls:     make(map[string]bool),
+	}
+}
+
+func (mgr *Manager) initRPC() {
+	var err error
+	mgr.serv, err = rpcserver.New(mgr.cfg, mgr, *flagDebug)
+	if err != nil {
+		log.Fatalf("failed to create rpc server: %v", err)
+	}
+	log.Logf(0, "serving rpc on tcp://%v", mgr.serv.Port)
+}
+
+func (mgr *Manager) initDash() {
+	cfg := mgr.cfg
+	opts := []dashapi.DashboardOpts{}
+	if cfg.DashboardUserAgent != "" {
+		opts = append(opts, dashapi.UserAgent(cfg.DashboardUserAgent))
+	}
+	dash, err := dashapi.New(cfg.DashboardClient, cfg.DashboardAddr, cfg.DashboardKey, opts...)
+	if err != nil {
+		log.Fatalf("failed to create dashapi connection: %v", err)
+	}
+	mgr.dashRepro = dash
+	if !cfg.DashboardOnlyRepro {
+		mgr.dash = dash
+	}
+}
+
+func (mgr *Manager) initAssetStorage() {
+	var err error
+	mgr.assetStorage, err = asset.StorageFromConfig(mgr.cfg.AssetStorage, mgr.dash)
+	if err != nil {
+		log.Fatalf("failed to init asset storage: %v", err)
+	}
 }
 
 type Mode int
@@ -211,10 +290,7 @@ func main() {
 		flag.PrintDefaults()
 		log.Fatalf("unknown mode: %v", *flagMode)
 	}
-	RunManager(mode, cfg)
-}
 
-func RunManager(mode Mode, cfg *mgrconfig.Config) {
 	var vmPool *vm.Pool
 	if !cfg.VMLess {
 		var err error
@@ -224,86 +300,68 @@ func RunManager(mode Mode, cfg *mgrconfig.Config) {
 		}
 	}
 
-	crashdir := filepath.Join(cfg.Workdir, "crashes")
-	osutil.MkdirAll(crashdir)
+	corpusUpdates := make(chan corpus.NewItemEvent, 128)
+	corpusPreload := make(chan []fuzzer.Candidate)
+
+	if *flagDebug {
+		cfg.Procs = 1
+	}
 
 	reporter, err := report.NewReporter(cfg)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
 
-	corpusUpdates := make(chan corpus.NewItemEvent, 128)
-	mgr := &Manager{
-		cfg:                cfg,
-		mode:               mode,
-		vmPool:             vmPool,
-		corpus:             corpus.NewMonitoredCorpus(context.Background(), corpusUpdates),
-		corpusPreload:      make(chan []fuzzer.Candidate),
-		target:             cfg.Target,
-		sysTarget:          cfg.SysTarget,
-		reporter:           reporter,
-		crashdir:           crashdir,
-		crashTypes:         make(map[string]bool),
-		disabledHashes:     make(map[string]struct{}),
-		memoryLeakFrames:   make(map[string]bool),
-		dataRaceFrames:     make(map[string]bool),
-		fresh:              true,
-		externalReproQueue: make(chan *Crash, 10),
-		crashes:            make(chan *Crash, 10),
-		saturatedCalls:     make(map[string]bool),
-	}
+	crashdir := filepath.Join(cfg.Workdir, "crashes")
+	osutil.MkdirAll(crashdir)
 
-	if *flagDebug {
-		mgr.cfg.Procs = 1
-	}
+	mgr := newManager(cfg, mode, vmPool, corpusUpdates, corpusPreload)
+	mgr.crashdir = crashdir
+	mgr.reporter = reporter
+	mgr.corpus = corpus.NewMonitoredCorpus(context.Background(), corpusUpdates)
 
-	mgr.initStats()
-	if mode == ModeFuzzing || mode == ModeCorpusTriage || mode == ModeCorpusRun {
-		go mgr.preloadCorpus()
+	mgr.run(mgr)
+	mgr.loop(mgr)
+}
+
+func (mgr *Manager) loop(impl managerImpl) {
+	ctx := vm.ShutdownCtx()
+	go impl.processFuzzingResults(ctx)
+
+	go mgr.reproMgr.Loop(ctx)
+	mgr.poolImpl.Loop(ctx)
+}
+
+func (mgr *Manager) run(impl managerImpl) {
+	impl.initStats()
+	if mgr.mode == ModeFuzzing || mgr.mode == ModeCorpusTriage || mgr.mode == ModeCorpusRun {
+		go impl.preloadCorpus()
 	} else {
 		close(mgr.corpusPreload)
 	}
-	mgr.initHTTP() // Creates HTTP server.
-	go mgr.corpusInputHandler(corpusUpdates)
-	go mgr.trackUsedFiles()
+	impl.initHTTP() // Creates HTTP server.
+	go impl.corpusInputHandler(mgr.corpusUpdates)
+	go impl.trackUsedFiles()
 
-	// Create RPC server for fuzzers.
-	mgr.serv, err = rpcserver.New(mgr.cfg, mgr, *flagDebug)
-	if err != nil {
-		log.Fatalf("failed to create rpc server: %v", err)
-	}
-	log.Logf(0, "serving rpc on tcp://%v", mgr.serv.Port)
+	impl.initRPC() // Create RPC server for fuzzers.
 
-	if cfg.DashboardAddr != "" {
-		opts := []dashapi.DashboardOpts{}
-		if cfg.DashboardUserAgent != "" {
-			opts = append(opts, dashapi.UserAgent(cfg.DashboardUserAgent))
-		}
-		dash, err := dashapi.New(cfg.DashboardClient, cfg.DashboardAddr, cfg.DashboardKey, opts...)
-		if err != nil {
-			log.Fatalf("failed to create dashapi connection: %v", err)
-		}
-		mgr.dashRepro = dash
-		if !cfg.DashboardOnlyRepro {
-			mgr.dash = dash
-		}
+	if mgr.cfg.DashboardAddr != "" {
+		impl.initDash()
 	}
 
-	if !cfg.AssetStorage.IsEmpty() {
-		mgr.assetStorage, err = asset.StorageFromConfig(cfg.AssetStorage, mgr.dash)
-		if err != nil {
-			log.Fatalf("failed to init asset storage: %v", err)
-		}
+	if !mgr.cfg.AssetStorage.IsEmpty() {
+		impl.initAssetStorage()
 	}
 
 	if *flagBench != "" {
-		mgr.initBench()
+		impl.initBench()
 	}
 
-	go mgr.heartbeatLoop()
+	go impl.heartbeatLoop()
 	if mgr.mode != ModeSmokeTest {
 		osutil.HandleInterrupts(vm.Shutdown)
 	}
+
 	if mgr.vmPool == nil {
 		log.Logf(0, "no VMs started (type=none)")
 		log.Logf(0, "you are supposed to start syz-executor manually as:")
@@ -311,12 +369,12 @@ func RunManager(mode Mode, cfg *mgrconfig.Config) {
 		<-vm.Shutdown
 		return
 	}
+
 	mgr.pool = vm.NewDispatcher(mgr.vmPool, mgr.fuzzerInstance)
+	mgr.poolImpl = mgr.pool // hack for unittest
 	mgr.reproMgr = newReproManager(mgr, mgr.vmPool.Count()-mgr.cfg.FuzzingVMs, mgr.cfg.DashboardOnlyRepro)
 	ctx := vm.ShutdownCtx()
-	go mgr.processFuzzingResults(ctx)
-	go mgr.reproMgr.Loop(ctx)
-	mgr.pool.Loop(ctx)
+	go impl.processFuzzingResults(ctx)
 }
 
 // Exit successfully in special operation modes.
