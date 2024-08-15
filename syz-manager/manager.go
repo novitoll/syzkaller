@@ -80,7 +80,7 @@ type Manager struct {
 	sysTarget       *targets.Target
 	reporter        *report.Reporter
 	crashdir        string
-	serv            *rpcserver.Server
+	serv            rpcserver.ServerInterface[rpcserver.Server]
 	corpus          *corpus.Corpus
 	corpusDB        *db.DB
 	corpusDBMu      sync.Mutex // for concurrent operations on corpusDB
@@ -268,12 +268,11 @@ func RunManager(mode Mode, cfg *mgrconfig.Config) {
 	go mgr.corpusInputHandler(corpusUpdates)
 	go mgr.trackUsedFiles()
 
-	// Create RPC server for fuzzers.
-	mgr.serv, err = rpcserver.New(mgr.cfg, mgr, *flagDebug)
+	serv, err := rpcserver.New(mgr.cfg, mgr, *flagDebug)
 	if err != nil {
 		log.Fatalf("failed to create rpc server: %v", err)
 	}
-	log.Logf(0, "serving rpc on tcp://%v", mgr.serv.Port)
+	mgr.startRPC(serv) // Create RPC server for fuzzers.
 
 	if cfg.DashboardAddr != "" {
 		opts := []dashapi.DashboardOpts{}
@@ -308,7 +307,7 @@ func RunManager(mode Mode, cfg *mgrconfig.Config) {
 	if mgr.vmPool == nil {
 		log.Logf(0, "no VMs started (type=none)")
 		log.Logf(0, "you are supposed to start syz-executor manually as:")
-		log.Logf(0, "syz-executor runner local manager.ip %v", mgr.serv.Port)
+		log.Logf(0, "syz-executor runner local manager.ip %v", mgr.serv.Ptr().Port)
 		<-vm.Shutdown
 		return
 	}
@@ -318,6 +317,14 @@ func RunManager(mode Mode, cfg *mgrconfig.Config) {
 	go mgr.processFuzzingResults(ctx)
 	go mgr.reproMgr.Loop(ctx)
 	mgr.pool.Loop(ctx)
+}
+
+func (mgr *Manager) startRPC(serv rpcserver.ServerInterface[rpcserver.Server]) {
+	if err := serv.Start(); err != nil {
+		log.Fatalf("failed to start rpc server: %v", err)
+	}
+	mgr.serv = serv
+	log.Logf(0, "serving rpc on tcp://%v", mgr.serv.Ptr().Port)
 }
 
 // Exit successfully in special operation modes.
@@ -711,7 +718,7 @@ func loadProg(target *prog.Target, data []byte) (*prog.Prog, error) {
 
 func (mgr *Manager) fuzzerInstance(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
 	mgr.mu.Lock()
-	serv := mgr.serv
+	serv := mgr.serv.Ptr()
 	mgr.mu.Unlock()
 	if serv == nil {
 		// We're in the process of switching off the RPCServer.
@@ -747,7 +754,7 @@ func (mgr *Manager) fuzzerInstance(ctx context.Context, inst *vm.Instance, updIn
 
 func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, injectExec <-chan bool,
 	finishCb vm.EarlyFinishCb) (*report.Report, []byte, error) {
-	fwdAddr, err := inst.Forward(mgr.serv.Port)
+	fwdAddr, err := inst.Forward(mgr.serv.Ptr().Port)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to setup port forwarding: %w", err)
 	}
@@ -1484,7 +1491,7 @@ func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
 			newSignal := fuzzer.Cover.GrabSignalDelta()
 			log.Logf(3, "distributing %d new signal", len(newSignal))
 			if len(newSignal) != 0 {
-				mgr.serv.DistributeSignalDelta(newSignal)
+				mgr.serv.Ptr().DistributeSignalDelta(newSignal)
 			}
 		}
 
@@ -1496,7 +1503,7 @@ func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
 			mgr.mu.Lock()
 			if mgr.phase == phaseLoadedCorpus {
 				if !mgr.cfg.Snapshot {
-					mgr.serv.TriagedCorpus()
+					mgr.serv.Ptr().TriagedCorpus()
 				}
 				if mgr.cfg.HubClient != "" {
 					mgr.phase = phaseTriagedCorpus
