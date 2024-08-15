@@ -55,6 +55,11 @@ type Manager interface {
 	CoverageFilter(modules []*vminfo.KernelModule) []uint64
 }
 
+type RPCServer interface {
+	Start()
+	Stop()
+}
+
 type Server struct {
 	Port int
 

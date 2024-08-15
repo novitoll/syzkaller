@@ -70,29 +70,10 @@ var (
 	flagTests = flag.String("tests", "", "prefix to match test file names (for -mode run-tests)")
 )
 
-type managerDependencies interface {
-	initStats()
-	initHTTP()
-	initRPC()
-	initDash()
-	initAssetStorage()
-	initBench()
-}
-
-type managerImpl interface {
-	managerDependencies
-	heartbeatLoop()
-	preloadCorpus()
-	corpusInputHandler(<-chan corpus.NewItemEvent)
-	trackUsedFiles()
-	processFuzzingResults(ctx context.Context)
-}
-
 type Manager struct {
 	cfg             *mgrconfig.Config
 	mode            Mode
 	vmPool          *vm.Pool
-	poolImpl        dispatcher.PoolImpl[*vm.Instance]
 	pool            *dispatcher.Pool[*vm.Instance]
 	target          *prog.Target
 	sysTarget       *targets.Target
@@ -148,17 +129,17 @@ func newManager(
 	cfg *mgrconfig.Config,
 	mode Mode,
 	vmPool *vm.Pool,
-	corpusUpdates chan corpus.NewItemEvent,
-	corpusPreload chan []fuzzer.Candidate,
+	reporter *report.Reporter,
 ) *Manager {
 	return &Manager{
 		cfg:                cfg,
 		mode:               mode,
 		vmPool:             vmPool,
-		corpusPreload:      corpusPreload,
-		corpusUpdates:      corpusUpdates,
+		corpusUpdates:      make(chan corpus.NewItemEvent, 128),
+		corpusPreload:      make(chan []fuzzer.Candidate),
 		target:             cfg.Target,
 		sysTarget:          cfg.SysTarget,
+		reporter:           reporter,
 		crashTypes:         make(map[string]bool),
 		disabledHashes:     make(map[string]struct{}),
 		memoryLeakFrames:   make(map[string]bool),
@@ -254,7 +235,7 @@ func (c *Crash) FullTitle() string {
 
 func main() {
 	if prog.GitRevision == "" {
-		log.Fatalf("bad syz-manager build: build with make, run bin/syz-manager")
+		log.Fatalf("bad syz-Manager build: build with make, run bin/syz-Manager")
 	}
 	flag.Parse()
 	log.EnableLogCaching(1000, 1<<20)
@@ -263,7 +244,7 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 	if cfg.DashboardAddr != "" {
-		// This lets better distinguish logs of individual syz-manager instances.
+		// This lets better distinguish logs of individual syz-Manager instances.
 		log.SetName(cfg.Name)
 	}
 	var mode Mode
@@ -300,9 +281,6 @@ func main() {
 		}
 	}
 
-	corpusUpdates := make(chan corpus.NewItemEvent, 128)
-	corpusPreload := make(chan []fuzzer.Candidate)
-
 	if *flagDebug {
 		cfg.Procs = 1
 	}
@@ -315,49 +293,38 @@ func main() {
 	crashdir := filepath.Join(cfg.Workdir, "crashes")
 	osutil.MkdirAll(crashdir)
 
-	mgr := newManager(cfg, mode, vmPool, corpusUpdates, corpusPreload)
+	mgr := newManager(cfg, mode, vmPool, reporter)
 	mgr.crashdir = crashdir
-	mgr.reporter = reporter
-	mgr.corpus = corpus.NewMonitoredCorpus(context.Background(), corpusUpdates)
-
-	mgr.run(mgr)
-	mgr.loop(mgr)
+	mgr.corpus = corpus.NewMonitoredCorpus(context.Background(), mgr.corpusUpdates)
+	mgr.run()
 }
 
-func (mgr *Manager) loop(impl managerImpl) {
-	ctx := vm.ShutdownCtx()
-	go impl.processFuzzingResults(ctx)
-
-	go mgr.reproMgr.Loop(ctx)
-	mgr.poolImpl.Loop(ctx)
-}
-
-func (mgr *Manager) run(impl managerImpl) {
-	impl.initStats()
+func (mgr *Manager) run() {
+	mgr.initStats()
 	if mgr.mode == ModeFuzzing || mgr.mode == ModeCorpusTriage || mgr.mode == ModeCorpusRun {
-		go impl.preloadCorpus()
+		go mgr.preloadCorpus()
 	} else {
 		close(mgr.corpusPreload)
 	}
-	impl.initHTTP() // Creates HTTP server.
-	go impl.corpusInputHandler(mgr.corpusUpdates)
-	go impl.trackUsedFiles()
+	mgr.initHTTP() // Creates HTTP server.
+	go mgr.corpusInputHandler(mgr.corpusUpdates)
+	go mgr.trackUsedFiles()
 
-	impl.initRPC() // Create RPC server for fuzzers.
+	mgr.initRPC() // Create RPC server for fuzzers.
 
 	if mgr.cfg.DashboardAddr != "" {
-		impl.initDash()
+		mgr.initDash()
 	}
 
 	if !mgr.cfg.AssetStorage.IsEmpty() {
-		impl.initAssetStorage()
+		mgr.initAssetStorage()
 	}
 
 	if *flagBench != "" {
-		impl.initBench()
+		mgr.initBench()
 	}
 
-	go impl.heartbeatLoop()
+	go mgr.heartbeatLoop()
 	if mgr.mode != ModeSmokeTest {
 		osutil.HandleInterrupts(vm.Shutdown)
 	}
@@ -365,16 +332,17 @@ func (mgr *Manager) run(impl managerImpl) {
 	if mgr.vmPool == nil {
 		log.Logf(0, "no VMs started (type=none)")
 		log.Logf(0, "you are supposed to start syz-executor manually as:")
-		log.Logf(0, "syz-executor runner local manager.ip %v", mgr.serv.Port)
+		log.Logf(0, "syz-executor runner local Manager.ip %v", mgr.serv.Port)
 		<-vm.Shutdown
 		return
 	}
 
 	mgr.pool = vm.NewDispatcher(mgr.vmPool, mgr.fuzzerInstance)
-	mgr.poolImpl = mgr.pool // hack for unittest
 	mgr.reproMgr = newReproManager(mgr, mgr.vmPool.Count()-mgr.cfg.FuzzingVMs, mgr.cfg.DashboardOnlyRepro)
 	ctx := vm.ShutdownCtx()
-	go impl.processFuzzingResults(ctx)
+	go mgr.processFuzzingResults(ctx)
+	go mgr.reproMgr.Loop(ctx)
+	mgr.pool.Loop(ctx)
 }
 
 // Exit successfully in special operation modes.
@@ -790,7 +758,7 @@ func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, inj
 
 	host, port, err := net.SplitHostPort(fwdAddr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse manager's address")
+		return nil, nil, fmt.Errorf("failed to parse Manager's address")
 	}
 	cmd := fmt.Sprintf("%v runner %v %v %v", executorBin, inst.Index(), host, port)
 	_, rep, err := inst.Run(mgr.cfg.Timeouts.VMRunningTime, mgr.reporter, cmd,
@@ -1556,7 +1524,7 @@ func (mgr *Manager) hubIsUnreachable() {
 	}
 }
 
-// trackUsedFiles() is checking that the files that syz-manager needs are not changed while it's running.
+// trackUsedFiles() is checking that the files that syz-Manager needs are not changed while it's running.
 func (mgr *Manager) trackUsedFiles() {
 	usedFiles := make(map[string]time.Time) // file name to modification time
 	addUsedFile := func(f string) {
@@ -1586,10 +1554,10 @@ func (mgr *Manager) trackUsedFiles() {
 				log.Fatalf("failed to stat %v: %v", f, err)
 			}
 			if mod != stat.ModTime() {
-				log.Fatalf("file %v that syz-manager uses has been modified by an external program\n"+
-					"this can lead to arbitrary syz-manager misbehavior\n"+
+				log.Fatalf("file %v that syz-Manager uses has been modified by an external program\n"+
+					"this can lead to arbitrary syz-Manager misbehavior\n"+
 					"modification time has changed: %v -> %v\n"+
-					"don't modify files that syz-manager uses. exiting to prevent harm",
+					"don't modify files that syz-Manager uses. exiting to prevent harm",
 					f, mod, stat.ModTime())
 			}
 		}

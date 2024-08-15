@@ -17,13 +17,6 @@ type Instance interface {
 	io.Closer
 }
 
-// TODO: add doc
-type PoolImpl[T Instance] interface {
-	Loop(ctx context.Context)
-	ReserveForRun(size int)
-	SetDefault(def Runner[T])
-}
-
 type UpdateInfo func(cb func(info *Info))
 type Runner[T Instance] func(ctx context.Context, inst T, updInfo UpdateInfo)
 type CreateInstance[T Instance] func(int) (T, error)

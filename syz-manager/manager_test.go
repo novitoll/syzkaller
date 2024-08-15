@@ -49,7 +49,7 @@ func TestRunManager(t *testing.T) {
 			vmPool, err := vm.Create(tt.cfg, *flagDebug)
 			assert.NoError(t, err)
 
-			mgr := newManager(tt.cfg, tt.mode, vmPool, nil, nil)
+			mgr := newManager(tt.cfg, tt.mode, vmPool, nil)
 			impl := new(managerImplMock)
 			shouldPreloadCorpus := mgr.mode == ModeFuzzing || mgr.mode == ModeCorpusTriage || mgr.mode == ModeCorpusRun
 
