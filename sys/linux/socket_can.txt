@@ -50,6 +50,18 @@ setsockopt$SO_J1939_SEND_PRIO(fd sock_can_j1939, level const[SOL_CAN_J1939], opt
 getsockopt$SO_J1939_PROMISC(fd sock_can_j1939, level const[SOL_CAN_J1939], opt const[SO_J1939_PROMISC], val ptr[out, int32], len ptr[inout, bytesize[val, int32]])
 getsockopt$SO_J1939_ERRQUEUE(fd sock_can_j1939, level const[SOL_CAN_J1939], opt const[SO_J1939_ERRQUEUE], val ptr[out, int32], len ptr[inout, bytesize[val, int32]])
 getsockopt$SO_J1939_SEND_PRIO(fd sock_can_j1939, level const[SOL_CAN_J1939], opt const[SO_J1939_SEND_PRIO], val ptr[out, int32], len ptr[inout, bytesize[val, int32]])
+getsockname$can_j1939(fd sock_can_j1939, addr ptr[out, sockaddr_can_j1939], addrlen ptr[inout, bytesize[addr, int32]])
+getpeername$can_j1939(fd sock_can_j1939, peer ptr[out, sockaddr_can_j1939], peerlen ptr[inout, bytesize[peer, int32]])
+
+# Specialized send operations for different transport protocol scenarios
+sendto$can_j1939_single(fd sock_can_j1939, buf ptr[in, array[int8, 0:8]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+sendto$can_j1939_tp(fd sock_can_j1939, buf ptr[in, array[int8, 9:1785]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+sendto$can_j1939_etp(fd sock_can_j1939, buf ptr[in, array[int8, 1786:8192]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+sendto$can_j1939_addr_claim(fd sock_can_j1939, buf ptr[in, array[int8, 8]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+
+# J1939 send/recv operations with different data sizes to trigger transport protocol paths
+sendto$can_j1939(fd sock_can_j1939, buf ptr[in, array[int8]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+recvfrom$can_j1939(fd sock_can_j1939, buf ptr[out, array[int8]], len bytesize[buf], flags flags[recv_flags], addr ptr[out, sockaddr_can_j1939, opt], addrlen ptr[inout, bytesize[addr, int32]])
 
 ioctl$ifreq_SIOCGIFINDEX_vcan(fd sock, cmd const[SIOCGIFINDEX], arg ptr[out, ifreq_dev_t[vcan_device_names, ifindex_vcan]])
 vcan_device_names = "vcan0", "vxcan0", "vxcan1"
@@ -68,6 +80,320 @@ sockaddr_can_j1939 {
 	pgn		can_j1939_pgn
 	addr		can_j1939_addr
 }
+
+# Enhanced J1939 types for better coverage
+# Invalid NAME ranges - fixed to stay within int64 bounds
+type j1939_name_invalid int64[0x1000000000000000:0x7FFFFFFFFFFFFFFF]
+# Beyond valid PGN range - fixed to stay within int32 bounds
+type j1939_pgn_invalid int32[0x40000:0x7FFFFFFF]
+# Beyond 8-bit range - fixed to stay within int8 bounds (0-127 for signed int8)
+type j1939_addr_invalid int8[100:127]
+
+# Enhanced address structure with invalid ranges for error path testing
+sockaddr_can_j1939_invalid {
+	can_family	const[AF_CAN, int16]
+	can_ifindex	ifindex_vcan
+	name		j1939_name_invalid
+	pgn		j1939_pgn_invalid
+	addr		j1939_addr_invalid
+}
+
+# Extended socket operations for error scenarios
+bind$can_j1939_invalid(fd sock_can_j1939, addr ptr[in, sockaddr_can_j1939_invalid], len bytesize[addr])
+connect$can_j1939_invalid(fd sock_can_j1939, addr ptr[in, sockaddr_can_j1939_invalid], len bytesize[addr])
+
+# Concurrent TP session operations to trigger session management
+sendto$can_j1939_tp_small(fd sock_can_j1939, buf ptr[in, array[int8, 9:100]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+sendto$can_j1939_tp_medium(fd sock_can_j1939, buf ptr[in, array[int8, 500:1000]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+sendto$can_j1939_tp_large(fd sock_can_j1939, buf ptr[in, array[int8, 1200:1785]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+
+# ETP variants for extended protocol testing
+sendto$can_j1939_etp_small(fd sock_can_j1939, buf ptr[in, array[int8, 1786:2000]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+sendto$can_j1939_etp_medium(fd sock_can_j1939, buf ptr[in, array[int8, 4000:8000]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+sendto$can_j1939_etp_large(fd sock_can_j1939, buf ptr[in, array[int8, 8000:8192]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+
+# Rapid-fire sends to trigger session conflicts and cancellations
+sendto$can_j1939_rapid(fd sock_can_j1939, buf ptr[in, array[int8, 100:500]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+
+# Zero-length and edge case packets - fixed to have minimum size 1
+sendto$can_j1939_empty(fd sock_can_j1939, buf ptr[in, array[int8, 1]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+sendto$can_j1939_boundary(fd sock_can_j1939, buf ptr[in, array[int8, 8]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939], addrlen bytesize[addr])
+
+# Invalid packet scenarios to trigger error paths
+sendto$can_j1939_invalid(fd sock_can_j1939, buf ptr[in, array[int8, 10:100]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_invalid], addrlen bytesize[addr])
+
+# Broadcast vs unicast scenarios
+sendto$can_j1939_broadcast(fd sock_can_j1939, buf ptr[in, array[int8, 9:1785]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_broadcast], addrlen bytesize[addr])
+
+# J1939 broadcast address structure
+sockaddr_can_j1939_broadcast {
+	can_family	const[AF_CAN, int16]
+	can_ifindex	ifindex_vcan
+	name		const[0, int64]
+	pgn		can_j1939_pgn
+	addr		const[0xff, int8]
+}
+
+# Advanced socket options for timeout and retry scenarios
+setsockopt$SO_J1939_RECV_TIMEOUT(fd sock_can_j1939, level const[SOL_SOCKET], optname const[20], optval ptr[in, timeval_short], optlen bytesize[optval])
+setsockopt$SO_J1939_SEND_TIMEOUT(fd sock_can_j1939, level const[SOL_SOCKET], optname const[21], optval ptr[in, timeval_short], optlen bytesize[optval])
+
+# Short timeout structure to trigger timer functions
+timeval_short {
+	tv_sec	int32[0:2]
+	tv_usec	int32[0:100000]
+}
+
+# MSG flags that can trigger different code paths
+j1939_msg_flags = MSG_DONTWAIT, MSG_NOSIGNAL, MSG_MORE, MSG_EOR, MSG_TRUNC, MSG_PEEK
+
+# Enhanced receive operations with different flags
+recvfrom$can_j1939_peek(fd sock_can_j1939, buf ptr[out, array[int8]], len bytesize[buf], flags const[MSG_PEEK], addr ptr[out, sockaddr_can_j1939, opt], addrlen ptr[inout, bytesize[addr, int32]])
+recvfrom$can_j1939_trunc(fd sock_can_j1939, buf ptr[out, array[int8, 1:10]], len bytesize[buf], flags const[MSG_TRUNC], addr ptr[out, sockaddr_can_j1939, opt], addrlen ptr[inout, bytesize[addr, int32]])
+recvfrom$can_j1939_dontwait(fd sock_can_j1939, buf ptr[out, array[int8]], len bytesize[buf], flags const[MSG_DONTWAIT], addr ptr[out, sockaddr_can_j1939, opt], addrlen ptr[inout, bytesize[addr, int32]])
+
+# Enhanced sendmsg for complex scenarios
+sendmsg$can_j1939_complex(fd sock_can_j1939, msg ptr[in, msghdr_can_j1939_complex], flags flags[j1939_msg_flags])
+
+msghdr_can_j1939_complex {
+	addr	ptr[in, sockaddr_can_j1939, opt]
+	addrlen	len[addr, int32]
+	vec	ptr[in, array[iovec_j1939_complex]]
+	vlen	len[vec, intptr]
+	ctrl	ptr[in, array[int8], opt]
+	ctrllen	len[ctrl, intptr]
+	f	flags[j1939_msg_flags, int32]
+}
+
+# Multiple iovec entries to test scatter-gather
+iovec_j1939_complex [
+	small	iovec[in, array[int8, 1:50]]
+	medium	iovec[in, array[int8, 100:500]]
+	large	iovec[in, array[int8, 1000:1785]]
+]
+
+# Enhanced J1939 filter with edge cases
+j1939_filter_edge {
+	name		flags[j1939_names_edge, int64]
+	name_mask	int64
+	pgn		flags[j1939_pgns_edge, int32]
+	pgn_mask	int32
+	addr		flags[j1939_addrs_edge, int8]
+	addr_mask	int8
+}
+
+# Edge case values for comprehensive testing
+j1939_names_edge = 0, 1, 0x1234567890ABCDEF, 0x7FFFFFFFFFFFFFFF
+j1939_pgns_edge = 0, 1, 0xEA00, 0xEE00, 0x3FFFF, 0x7FFFFFFF
+j1939_addrs_edge = 0, 1, 0xFD, 0xFE, 0xFF, 0x7F
+
+# Enhanced filter socket option
+setsockopt$SO_J1939_FILTER_EDGE(fd sock_can_j1939, level const[SOL_CAN_J1939], opt const[SO_J1939_FILTER], val ptr[in, array[j1939_filter_edge]], len bytesize[val])
+
+# Multiple socket scenario - create multiple J1939 sockets for concurrent testing
+socket$can_j1939_secondary(domain const[AF_CAN], type const[SOCK_DGRAM], proto const[CAN_J1939]) sock_can_j1939
+
+# Cross-socket operations to trigger session conflicts
+sendto$can_j1939_cross(fd sock_can_j1939, buf ptr[in, array[int8, 9:1785]], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_cross], addrlen bytesize[addr])
+
+# Address structure for cross-socket communication
+sockaddr_can_j1939_cross {
+	can_family	const[AF_CAN, int16]
+	can_ifindex	ifindex_vcan
+	name		int64[1:10]
+	pgn		int32[0x1000:0x2000]
+	addr		int8[1:10]
+}
+
+# Transport Protocol Control Message structures
+j1939_tp_rts_msg {
+	# J1939_TP_CMD_RTS
+	cmd		const[0x10, int8]
+	size_lsb	int8
+	size_msb	int8
+	packets		int8
+	max_packets	int8[1:255]
+	pgn_lsb		int8
+	pgn_mid		int8
+	pgn_msb		int8
+}
+
+j1939_tp_cts_msg {
+	# J1939_TP_CMD_CTS
+	cmd		const[0x11, int8]
+	num_packets	int8[1:255]
+	next_packet	int8[1:255]
+	reserved1	const[0xff, int8]
+	reserved2	const[0xff, int8]
+	pgn_lsb		int8
+	pgn_mid		int8
+	pgn_msb		int8
+}
+
+j1939_tp_eoma_msg {
+	# J1939_TP_CMD_EOMA
+	cmd		const[0x13, int8]
+	size_lsb	int8
+	size_msb	int8
+	packets		int8
+	reserved	const[0xff, int8]
+	pgn_lsb		int8
+	pgn_mid		int8
+	pgn_msb		int8
+}
+
+j1939_tp_bam_msg {
+	# J1939_TP_CMD_BAM
+	cmd		const[0x20, int8]
+	size_lsb	int8
+	size_msb	int8
+	packets		int8
+	reserved	const[0xff, int8]
+	pgn_lsb		int8
+	pgn_mid		int8
+	pgn_msb		int8
+}
+
+j1939_tp_abort_msg {
+	# J1939_TP_CMD_ABORT
+	cmd		const[0xff, int8]
+	reason		int8[1:8]
+	reserved1	const[0xff, int8]
+	reserved2	const[0xff, int8]
+	reserved3	const[0xff, int8]
+	pgn_lsb		int8
+	pgn_mid		int8
+	pgn_msb		int8
+}
+
+# Extended Transport Protocol Control Messages
+j1939_etp_rts_msg {
+	# J1939_ETP_CMD_RTS
+	cmd		const[0x14, int8]
+	size_byte1	int8
+	size_byte2	int8
+	size_byte3	int8
+	size_byte4	int8
+	pgn_lsb		int8
+	pgn_mid		int8
+	pgn_msb		int8
+}
+
+j1939_etp_cts_msg {
+	# J1939_ETP_CMD_CTS
+	cmd		const[0x15, int8]
+	num_packets	int8
+	next_packet_lsb	int8
+	next_packet_msb	int8
+	reserved	const[0xff, int8]
+	pgn_lsb		int8
+	pgn_mid		int8
+	pgn_msb		int8
+}
+
+j1939_etp_dpo_msg {
+	# J1939_ETP_CMD_DPO
+	cmd		const[0x16, int8]
+	num_packets	int8
+	packet_offset_lsb int8
+	packet_offset_mid int8
+	packet_offset_msb int8
+	pgn_lsb		int8
+	pgn_mid		int8
+	pgn_msb		int8
+}
+
+j1939_etp_eoma_msg {
+	# J1939_ETP_CMD_EOMA
+	cmd		const[0x17, int8]
+	size_byte1	int8
+	size_byte2	int8
+	size_byte3	int8
+	size_byte4	int8
+	pgn_lsb		int8
+	pgn_mid		int8
+	pgn_msb		int8
+}
+
+j1939_etp_abort_msg {
+	# J1939_ETP_CMD_ABORT
+	cmd		const[0xff, int8]
+	reason		int8[1:8]
+	reserved1	const[0xff, int8]
+	reserved2	const[0xff, int8]
+	reserved3	const[0xff, int8]
+	pgn_lsb		int8
+	pgn_mid		int8
+	pgn_msb		int8
+}
+
+# Transport Protocol Data message (variable length)
+j1939_tp_dat_msg {
+	seq_num		int8[1:255]
+	data		array[int8, 1:7]
+}
+
+# Specific syscalls for TP control messages
+sendto$can_j1939_tp_rts(fd sock_can_j1939, buf ptr[in, j1939_tp_rts_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_tp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_tp_cts(fd sock_can_j1939, buf ptr[in, j1939_tp_cts_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_tp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_tp_eoma(fd sock_can_j1939, buf ptr[in, j1939_tp_eoma_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_tp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_tp_bam(fd sock_can_j1939, buf ptr[in, j1939_tp_bam_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_tp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_tp_abort(fd sock_can_j1939, buf ptr[in, j1939_tp_abort_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_tp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_tp_dat(fd sock_can_j1939, buf ptr[in, j1939_tp_dat_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_tp_dat], addrlen bytesize[addr])
+
+# Specific syscalls for ETP control messages
+sendto$can_j1939_etp_rts(fd sock_can_j1939, buf ptr[in, j1939_etp_rts_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_etp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_etp_cts(fd sock_can_j1939, buf ptr[in, j1939_etp_cts_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_etp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_etp_dpo(fd sock_can_j1939, buf ptr[in, j1939_etp_dpo_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_etp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_etp_eoma(fd sock_can_j1939, buf ptr[in, j1939_etp_eoma_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_etp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_etp_abort(fd sock_can_j1939, buf ptr[in, j1939_etp_abort_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_etp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_etp_dat(fd sock_can_j1939, buf ptr[in, j1939_tp_dat_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_etp_dat], addrlen bytesize[addr])
+
+# Address structures for TP/ETP control and data messages
+sockaddr_can_j1939_tp_ctl {
+	can_family	const[AF_CAN, int16]
+	can_ifindex	ifindex_vcan
+	name		can_j1939_name
+	# J1939_TP_PGN_CTL
+	pgn		const[0xec00, int32]
+	addr		can_j1939_addr
+}
+
+sockaddr_can_j1939_tp_dat {
+	can_family	const[AF_CAN, int16]
+	can_ifindex	ifindex_vcan
+	name		can_j1939_name
+	# J1939_TP_PGN_DAT
+	pgn		const[0xeb00, int32]
+	addr		can_j1939_addr
+}
+
+sockaddr_can_j1939_etp_ctl {
+	can_family	const[AF_CAN, int16]
+	can_ifindex	ifindex_vcan
+	name		can_j1939_name
+	# J1939_ETP_PGN_CTL
+	pgn		const[0xc800, int32]
+	addr		can_j1939_addr
+}
+
+sockaddr_can_j1939_etp_dat {
+	can_family	const[AF_CAN, int16]
+	can_ifindex	ifindex_vcan
+	name		can_j1939_name
+	# J1939_ETP_PGN_DAT
+	pgn		const[0xc700, int32]
+	addr		can_j1939_addr
+}
+
+# Malformed control messages for error path testing
+j1939_tp_malformed_msg {
+	cmd		int8[0:255]
+	data		array[int8, 7]
+}
+
+sendto$can_j1939_tp_malformed(fd sock_can_j1939, buf ptr[in, j1939_tp_malformed_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_tp_ctl], addrlen bytesize[addr])
+sendto$can_j1939_etp_malformed(fd sock_can_j1939, buf ptr[in, j1939_tp_malformed_msg], len bytesize[buf], flags flags[send_flags], addr ptr[in, sockaddr_can_j1939_etp_ctl], addrlen bytesize[addr])
 
 can_j1939_pgn {
 	pgn_ps		flags[can_j1939_pgn_ps, int8]
